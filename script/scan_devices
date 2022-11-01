@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+
+#
+# This program scans the network to find devices, and display their configuration
+#
+
+import json
+import pprint
+import socket
+import time
+
+SCAN_DURATION_SECS = 7
+SCAN_PORT = 1139
+SCAN_PACKET_MAX_SIZE = 4096
+
+def scan_devices():
+    devices = {}
+
+    print("Searching for devices...")
+
+    deadline = time.time() + SCAN_DURATION_SECS
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("0.0.0.0", SCAN_PORT))
+    try:
+        while True:
+            timeout = deadline - time.time()
+            if timeout < 0:
+                break
+            s.settimeout(timeout)
+            data, (ip, port) = s.recvfrom(SCAN_PACKET_MAX_SIZE)
+            try:
+                device_info = {}
+                beacon = json.loads(data.decode('utf-8'))
+                for nic in beacon["ifconfigs"]:
+                    if nic[0] == ip and nic[0] not in devices:
+                        device_info = beacon
+                        device_info["ip"] = nic[0]
+                        device_info["network"] = nic[1]
+                        print(f"  - Found {device_info['settings']['board']['host_name']}.local ({device_info['ip']})")
+                        devices[nic[0]] = device_info
+            except:
+                continue
+    except TimeoutError:
+        pass
+
+    print("Scan done.")
+
+    return devices
+
+def main():
+    pprint.pp(scan_devices())
+
+if __name__ == "__main__":
+    main()

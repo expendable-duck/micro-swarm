@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+
+#
+# This program pushes new code to all devices present on the ethernet (and on the same subnet as this machine)
+# The sync is made using the ftp protocol
+#
+
+import asyncio
+import json
+import os
+import socket
+import sys
+import time
+
+SCAN_DURATION_SECS = 7
+SCAN_PACKET_MAX_SIZE = 4096
+SCAN_PORT = 1139
+
+def scan_devices():
+    devices = {}
+
+    print("Searching for devices...")
+
+    deadline = time.time() + SCAN_DURATION_SECS
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("0.0.0.0", SCAN_PORT))
+    try:
+        while True:
+            timeout = deadline - time.time()
+            if timeout < 0:
+                break
+            s.settimeout(timeout)
+            data, (ip, port) = s.recvfrom(SCAN_PACKET_MAX_SIZE)
+            try:
+                device_info = {}
+                beacon = json.loads(data.decode('utf-8'))
+                for nic in beacon["ifconfigs"]:
+                    if nic[0] == ip and nic[0] not in devices:
+                        device_info = beacon
+                        device_info["ip"] = nic[0]
+                        device_info["network"] = nic[1]
+                        print(f"  - Found {device_info['settings']['board']['host_name']}.local ({device_info['ip']})")
+                        devices[nic[0]] = device_info
+            except:
+                continue
+    except TimeoutError:
+        pass
+
+    print("Scan done.")
+
+    return devices
+
+
+def escape_lftp_arg(arg):
+    return "'"+str(arg).replace("\\", "\\\\").replace("'", "\\'")+"'"
+
+async def lftp_exec(commands, args=[]):
+    """
+        Execute external lftp program.
+        args is a list of arguments passed to lftp exec
+        commands is a list of lftp script commands in this format:
+        [
+            [ "cmd1", "cmd1arg1", "cmd1arg2", ... ],
+            [ "cmd2", "cmd2arg1", "cmd2arg2", ... ],
+            ...
+        ]
+    """
+
+    # Generate and execute the lftp script
+    lftp_script = ';\n'.join(' '.join(escape_lftp_arg(arg) for arg in command) for command in commands)
+
+    # Exec lftp program
+    proc = await asyncio.create_subprocess_exec(
+        "lftp", "-c", lftp_script,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stdout, stderr = await proc.communicate()
+
+    return (stdout, stderr, proc.returncode)
+
+async def push_code(device_info):
+
+    if not device_info['settings']['boot'].get('FTPD_ENABLE', None):
+        return (False, "", "", "fptd is not enabled")
+
+    src_dir = os.path.abspath(os.path.join(__file__, "..", ".."))
+
+    app_name = device_info['settings']['board']['app_name']
+    ftp_ip = device_info['ip']
+    ftp_port = device_info['settings']['boot'].get('FTPD_PORT', 23)
+
+    try:
+        async with asyncio.timeout(6):
+            reader, writer = await asyncio.open_connection(ftp_ip, ftp_port)
+            writer.close()
+            await writer.wait_closed()
+    except TimeoutError:
+        return (False, "", "", "fptd does not respond")
+
+    async with asyncio.timeout(180):
+        # Upload code using lftp
+        (stdout, stderr, returncode) = await lftp_exec([
+            [ "set", "cmd:fail-exit", "yes" ],
+            [ "set", "ftp:list-options", "-a" ],
+            [ "set", "ftp:passive-mode", "yes" ],
+            [ "open", f"ftp://{ftp_ip}:{ftp_port}" ],
+            [ "lcd", os.path.join(src_dir, "apps", device_info['settings']['board']['app_name']) ],
+            [ "cd", f"/apps/{device_info['settings']['board']['app_name']}/", ],
+            [ "mirror",
+                "--reverse",
+                "--scan-all-first",
+                "--transfer-all",
+                "--delete",
+                "--use-cache",
+                "--verbose",
+                "--no-perms",
+                "--no-umask",
+                "--parallel=1",
+                "--exclude-glob", "__pycache__",
+                "--exclude-glob", ".*",
+            ],
+        ])
+
+    rebooted = False
+    if not returncode:
+        async with asyncio.timeout(4):
+            # Connect to port remote exec port to trigger a reset if the service is available
+            if device_info['settings']['boot'].get('REMOTE_EVAL_ENABLE', None):
+                reader, writer = await asyncio.open_connection(device_info['ip'], device_info['settings']['boot'].get('REMOTE_EVAL_PORT', 1139))
+
+                writer.write(rb"""if True:
+                    print("\nReset triggered after code deployment...\n")
+                    import machine
+                    machine.reset()
+                """)
+                await writer.drain()
+
+                writer.close()
+                await writer.wait_closed()
+                rebooted = True
+
+    return (rebooted, stdout, stderr, f"code={returncode}" if returncode else '')
+
+
+async def main():
+
+    if not sys.version_info >= (3, 11):
+        print("minimal version of python required: 3.11")
+        sys.exit(1)
+
+    results = {}
+
+    async def push(key, device_info):
+        result = await push_code(device_info)
+        (rebooted, stdout, stderr, errmsg) = result
+
+        device_ident = f"{device_info['settings']['board']['host_name']}.local ({device_info['ip']})"
+
+        if stdout or stderr:
+            print(f'*******\n{device_ident} {errmsg}:')
+            if stdout:
+                print(f'  stdout:')
+                print('    ' + stdout.decode().replace('\n', '\n    '))
+            if stderr:
+                print(f'  stderr:')
+                print('    ' + stderr.decode().replace('\n', '\n    '))
+
+        results[key] = result
+
+    devices = scan_devices()
+
+    print("Pushing new code...")
+    async with asyncio.TaskGroup() as tg:
+        for (key, device_info) in devices.items():
+            tg.create_task(push(key, device_info))
+
+    had_error = False
+    print('=======\nSync results:')
+    for (key, device_info) in devices.items():
+        device_ident = f"{device_info['settings']['board']['host_name']}.local ({device_info['ip']})"
+        (rebooted, stdout, stderr, errmsg) = results[key]
+        app_name = device_info['settings']['board']['app_name']
+        if not errmsg:
+            print(f"  - Sync OK   {device_ident}, app_name={app_name}, rebooted={rebooted}")
+        else:
+            had_error = True
+            print(f"  - Sync FAIL {device_ident}, app_name={app_name}, rebooted={rebooted}, errmsg={errmsg}")
+
+    print("Pushing new code done.\n")
+
+    if had_error:
+        print("/!\\ FAILURE!")
+    else:
+        print("ALL OK.")
+
+if __name__ == "__main__":
+    asyncio.run(main())

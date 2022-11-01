@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+
+import itertools
+import os.path
+import re
+import rshell.main
+import sys
+import tempfile
+
+def rshell_exec(serial_port, serial_bauds, commands):
+    # Generate and execute the rshell script
+    with tempfile.NamedTemporaryFile() as commands_file:
+        script = '\n'.join(map(lambda cmd: ' '.join(cmd[0:1] + list(map(lambda arg: '"'+str(arg).replace('\\', '\\\\').replace('"', '\\"')+'"', cmd[1:]))), commands))
+        commands_file.write(bytes(script, encoding="UTF-8"))
+        commands_file.flush()
+
+        saved_argv = sys.argv
+        try:
+            sys.argv = [
+                "rshell",
+                "--port", str(serial_port),
+                "--baud", str(serial_bauds),
+                "--file", commands_file.name,
+            ]
+            rshell.main.main()
+        finally:
+            sys.argv = saved_argv
+
+def rshell_write_file_cmd(file_path, file_content):
+    return [ "repl", "", "f=open(" + repr(file_path) + ", 'w'); f.write(", repr(file_content), "); f.close()", "~" ]
+
+
+def deindent_string(s):
+    indents = re.findall(r"(?m)^([ \t\r]*)\S", s)
+    if len(indents)==0:
+        return s
+    common_indent = ''.join(c[0] for c in itertools.takewhile(lambda x: all(x[0] == y for y in x), zip(*indents)))
+    return re.sub(r'(?m)^'+re.escape(common_indent), '', s)
+
+def cmd_program_device(serial_port, serial_bauds, device_name, hardware_name, app_name):
+    src_dir = os.path.abspath(os.path.join(__file__, "..", ".."))
+
+    board_path = "/%s" % device_name
+
+    # Set board.py content to the current variables
+    board_py_content = deindent_string(f"""
+        name          = {repr(device_name)}
+        device_name   = {repr(device_name)}
+        hardware_name = {repr(hardware_name)}
+        app_name      = {repr(app_name)}
+        host_name     = {repr(device_name.replace("_", "-"))}
+    """)
+
+    packages_py_content = deindent_string(f"""
+        from apps      import {app_name}   as app
+        from hardwares import {hardware_name} as hardware
+    """)
+
+    empty_main_package_content = deindent_string(f"""
+        async def routine_main():
+            print('The firmware boot was correctly installed. Please push source code by connecting the device on ethernet, and run push_code')
+    """)
+
+    # Create board.py to set the correct board name
+    rshell_exec(serial_port, serial_bauds, [
+        rshell_write_file_cmd("/board.py", board_py_content),
+    ])
+
+    # Sync the boot code
+    rshell_exec(serial_port, serial_bauds, [
+        # Copy boot directory as root directory
+        [ "rsync", "--mirror", os.path.join(src_dir, "boot", "root"), board_path ],
+
+        # Recreate board.py that has been destroyed by previous rsync mirror commands
+        rshell_write_file_cmd("/board.py", board_py_content),
+
+        # Create 'symlinks' to hardware and app packages
+        rshell_write_file_cmd("/bootpkg/app.py",      f"from apps.{app_name} import *"),
+        rshell_write_file_cmd("/bootpkg/hardware.py", f"from hardwares.{hardware_name} import *"),
+
+        # Copy the relevant hardware package
+        [ "mkdir",  board_path+"/hardwares" ],
+        [ "rsync", "--mirror", os.path.join(src_dir, "boot", "hardwares", hardware_name), board_path+"/hardwares/"+hardware_name ],
+
+        # Create an empty main package
+        [ "mkdir",  board_path+"/apps" ],
+        [ "mkdir",  board_path+"/apps/"+app_name ],
+        rshell_write_file_cmd("/apps/"+app_name+"/__init__.py", empty_main_package_content),
+
+        # Trigger a soft reset to apply new code
+        [ "repl", "", "import machine ; machine.soft_reset()", "~" ],
+    ])
+
+def main():
+    if len(sys.argv) < 5:
+        print("Usage: %s <host_name> <app_name> <hardware_name> <serial_port> [<bauds>=115200]" % sys.argv[0])
+        print("    example: %s main_entrance_door rfid_door_lock wesp32 /dev/tty.usbserial-0" % sys.argv[0])
+        sys.exit(1)
+        return
+
+    device_name   = sys.argv[1]
+    app_name      = sys.argv[2]
+    hardware_name = sys.argv[3]
+    serial_port   = sys.argv[4]
+    if len(sys.argv) >= 6:
+        serial_bauds = sys.argv[5]
+    else:
+        serial_bauds = 115200
+
+    return cmd_program_device(serial_port, serial_bauds, device_name, hardware_name, app_name)
+
+if __name__ == "__main__":
+    main()
